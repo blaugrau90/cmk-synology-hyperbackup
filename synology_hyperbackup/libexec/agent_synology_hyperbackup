@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Synology Hyper Backup Special Agent for Checkmk 2.4.
+
+Connects to the Synology DSM Web API and retrieves the status of all
+Hyper Backup tasks. Outputs a Checkmk agent section with one JSON line
+per task.
+"""
+
+import argparse
+import json
+import re
+import ssl
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime
+
+SECTION_HEADER = "<<<synology_hyperbackup:sep(0)>>>"
+
+
+def make_ssl_context(verify: bool) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def api_get(base_url: str, params: dict, ctx: ssl.SSLContext, timeout: int) -> dict:
+    """Perform a GET request to the DSM API and return the data payload."""
+    url = f"{base_url}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Connection error: {exc}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON response: {exc}") from exc
+
+    if not data.get("success", False):
+        error = data.get("error", {})
+        raise RuntimeError(
+            f"API error code={error.get('code', '?')}: {json.dumps(error)}"
+        )
+    return data.get("data", {})
+
+
+def login(base_url: str, account: str, password: str, ctx: ssl.SSLContext, timeout: int) -> str:
+    data = api_get(base_url, {
+        "api": "SYNO.API.Auth",
+        "version": "6",
+        "method": "login",
+        "account": account,
+        "passwd": password,
+        "session": "CheckmkHyperBackup",
+        "format": "sid",
+    }, ctx, timeout)
+    return data["sid"]
+
+
+def logout(base_url: str, sid: str, ctx: ssl.SSLContext, timeout: int) -> None:
+    try:
+        api_get(base_url, {
+            "api": "SYNO.API.Auth",
+            "version": "6",
+            "method": "logout",
+            "session": "CheckmkHyperBackup",
+            "_sid": sid,
+        }, ctx, timeout)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def get_tasks(base_url: str, sid: str, ctx: ssl.SSLContext, timeout: int) -> list:
+    data = api_get(base_url, {
+        "api": "SYNO.Backup.Task",
+        "version": "1",
+        "method": "list",
+        "additional": json.dumps(["schedule"]),
+        "_sid": sid,
+    }, ctx, timeout)
+    return data.get("task_list", [])
+
+
+def get_log_entries(base_url: str, sid: str, ctx: ssl.SSLContext, timeout: int, limit: int = 500) -> list:
+    data = api_get(base_url, {
+        "api": "SYNO.SDS.Backup.Client.Common.Log",
+        "version": "1",
+        "method": "list",
+        "offset": "0",
+        "limit": str(limit),
+        "_sid": sid,
+    }, ctx, timeout)
+    return data.get("log_list", [])
+
+
+# Matches: [...][TaskName] Backup task finished successfully
+#      or: [...][TaskName] Backup task failed
+_PATTERN_BACKUP = re.compile(
+    r"\[([^\]]+)\]\s+Backup task (finished successfully|failed)"
+)
+
+
+def parse_last_backups(log_entries: list, task_names: set) -> dict:
+    """Scan log entries (newest-first) for the last backup result per task."""
+    results: dict = {}
+    remaining = set(task_names)
+
+    for entry in log_entries:
+        if not remaining:
+            break
+        event = entry.get("event", "")
+        m = _PATTERN_BACKUP.search(event)
+        if not m:
+            continue
+
+        task_name = m.group(1)
+        outcome = m.group(2)
+
+        if task_name not in remaining:
+            continue
+
+        time_str = entry.get("time", "")
+        timestamp = None
+        try:
+            dt = datetime.strptime(time_str, "%Y/%m/%d %H:%M:%S")
+            timestamp = int(dt.timestamp())
+        except ValueError:
+            pass
+
+        results[task_name] = {
+            "last_backup_time": timestamp,
+            "last_backup_result": "success" if "finished" in outcome else "failed",
+        }
+        remaining.discard(task_name)
+
+    return results
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Synology Hyper Backup special agent for Checkmk"
+    )
+    parser.add_argument("--host", required=True, help="DSM hostname or IP address")
+    parser.add_argument("--port", type=int, default=5001, help="DSM HTTPS port (default: 5001)")
+    parser.add_argument("--username", required=True, help="DSM username")
+    parser.add_argument("--password", required=True, help="DSM password")
+    parser.add_argument("--no-verify-ssl", action="store_true",
+                        help="Disable SSL certificate verification (for self-signed certs)")
+    parser.add_argument("--timeout", type=int, default=30,
+                        help="Request timeout in seconds (default: 30)")
+    args = parser.parse_args()
+
+    base_url = f"https://{args.host}:{args.port}/webapi/entry.cgi"
+    ctx = make_ssl_context(verify=not args.no_verify_ssl)
+
+    sid = None
+    try:
+        try:
+            sid = login(base_url, args.username, args.password, ctx, args.timeout)
+        except RuntimeError as exc:
+            print(f"ERROR: Login failed: {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            tasks = get_tasks(base_url, sid, ctx, args.timeout)
+        except RuntimeError as exc:
+            print(f"ERROR: Failed to retrieve task list: {exc}", file=sys.stderr)
+            return 1
+
+        log_entries: list = []
+        try:
+            log_entries = get_log_entries(base_url, sid, ctx, args.timeout)
+        except RuntimeError as exc:
+            print(f"WARNING: Failed to retrieve log entries: {exc}", file=sys.stderr)
+
+        task_names = {t["name"] for t in tasks}
+        last_backups = parse_last_backups(log_entries, task_names)
+
+        print(SECTION_HEADER)
+        for task in tasks:
+            name = task.get("name", "")
+            schedule = task.get("schedule", {})
+            sched_details = schedule.get("schedule", {})
+
+            output = {
+                "task_id": task.get("task_id"),
+                "name": name,
+                "state": task.get("state"),
+                "status": task.get("status"),
+                "target_type": task.get("target_type"),
+                "transfer_type": task.get("transfer_type"),
+                "data_enc": task.get("data_enc", False),
+                "schedule_enable": schedule.get("schedule_enable", False),
+                "next_trigger_time": sched_details.get("next_trigger_time"),
+                "last_backup_time": last_backups.get(name, {}).get("last_backup_time"),
+                "last_backup_result": last_backups.get(name, {}).get("last_backup_result"),
+            }
+            print(json.dumps(output, ensure_ascii=False))
+
+        return 0
+
+    finally:
+        if sid is not None:
+            logout(base_url, sid, ctx, args.timeout)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
