@@ -1,4 +1,4 @@
-{'author': 'Luca-Leon Hausdoerfer',
+{'author': 'Luca-Leon Hausdoerfer - (cmk@hausdoerfer.dev)',
  'description': 'Monitors all Synology Hyper Backup tasks via the DSM Web API. '
                 'Reports task state, last backup age and schedule information.',
  'download_url': 'https://github.com/blaugrau90/cmk-synology-hyperbackup',
@@ -8,7 +8,7 @@
                                    'synology_hyperbackup/server_side_calls/special_agent.py']},
  'name': 'synology_hyperbackup',
  'title': 'Synology Hyper Backup',
- 'version': '1.0.0',
- 'version.min_required': '2.4.0b1',
+ 'version': '1.1.0',
+ 'version.min_required': '2.3.0b1',
  'version.packaged': 'manual',
  'version.usable_until': None}
