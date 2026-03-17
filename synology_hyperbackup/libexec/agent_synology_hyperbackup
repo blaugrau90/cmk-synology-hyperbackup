@@ -104,6 +104,43 @@ _PATTERN_BACKUP = re.compile(
     r"\[([^\]]+)\]\s+Backup task (finished successfully|failed)"
 )
 
+# Matches integrity check log events (newest-first scan → first hit = latest event)
+_PATTERN_IC_STARTED = re.compile(r"\[([^\]]+)\]\s+Backup integrity check has started\.")
+_PATTERN_IC_FINISHED = re.compile(r"\[([^\]]+)\]\s+Backup integrity check is finished\.")
+_PATTERN_IC_FAILED = re.compile(r"\[([^\]]+)\]\s+Failed to run backup integrity check\.")
+
+
+def parse_integrity_states(log_entries: list, task_names: set) -> dict:
+    """Scan log entries (newest-first) for the latest integrity check event per task.
+
+    Returns a dict mapping task name to one of:
+      'detect_running'  – check has started but not yet finished/failed
+      'detect_failed'   – check completed with an error
+      'detect_ok'       – check completed successfully
+    Only tasks for which an integrity check event was found are included.
+    """
+    results: dict = {}
+    remaining = set(task_names)
+
+    for entry in log_entries:
+        if not remaining:
+            break
+        event = entry.get("event", "")
+        for pattern, ic_state in (
+            (_PATTERN_IC_STARTED, "detect_running"),
+            (_PATTERN_IC_FAILED, "detect_failed"),
+            (_PATTERN_IC_FINISHED, "detect_ok"),
+        ):
+            m = pattern.search(event)
+            if m:
+                task_name = m.group(1)
+                if task_name in remaining:
+                    results[task_name] = ic_state
+                    remaining.discard(task_name)
+                break
+
+    return results
+
 
 def parse_last_backups(log_entries: list, task_names: set) -> dict:
     """Scan log entries (newest-first) for the last backup result per task."""
@@ -180,6 +217,7 @@ def main() -> int:
 
         task_names = {t["name"] for t in tasks}
         last_backups = parse_last_backups(log_entries, task_names)
+        integrity_states = parse_integrity_states(log_entries, task_names)
 
         print(SECTION_HEADER)
         for task in tasks:
@@ -187,10 +225,18 @@ def main() -> int:
             schedule = task.get("schedule", {})
             sched_details = schedule.get("schedule", {})
 
+            # DSM reports error_detect both while a check is running and after it
+            # fails. Correct the state using the most recent log event.
+            task_state = task.get("state")
+            if task_state == "error_detect":
+                ic = integrity_states.get(name)
+                if ic == "detect_running":
+                    task_state = "detect_running"
+
             output = {
                 "task_id": task.get("task_id"),
                 "name": name,
-                "state": task.get("state"),
+                "state": task_state,
                 "status": task.get("status"),
                 "target_type": task.get("target_type"),
                 "transfer_type": task.get("transfer_type"),
