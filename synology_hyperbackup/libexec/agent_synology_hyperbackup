@@ -98,10 +98,14 @@ def get_log_entries(base_url: str, sid: str, ctx: ssl.SSLContext, timeout: int, 
     return data.get("log_list", [])
 
 
-# Matches: [...][TaskName] Backup task finished successfully
-#      or: [...][TaskName] Backup task failed
-_PATTERN_BACKUP = re.compile(
-    r"\[([^\]]+)\]\s+Backup task (finished successfully|failed)"
+# Matches successful backup completion
+_PATTERN_BACKUP_SUCCESS = re.compile(
+    r"\[([^\]]+)\]\s+Backup task finished successfully"
+)
+
+# Matches backup task failure (DSM logs "Failed to run/start backup task")
+_PATTERN_BACKUP_FAILED = re.compile(
+    r"\[([^\]]+)\]\s+Failed to (?:run|start) backup task"
 )
 
 # Matches integrity check log events (newest-first scan → first hit = latest event)
@@ -151,14 +155,19 @@ def parse_last_backups(log_entries: list, task_names: set) -> dict:
         if not remaining:
             break
         event = entry.get("event", "")
-        m = _PATTERN_BACKUP.search(event)
-        if not m:
-            continue
 
-        task_name = m.group(1)
-        outcome = m.group(2)
+        task_name = None
+        outcome = None
+        if _PATTERN_BACKUP_SUCCESS.search(event):
+            m = _PATTERN_BACKUP_SUCCESS.search(event)
+            task_name = m.group(1)
+            outcome = "success"
+        elif _PATTERN_BACKUP_FAILED.search(event):
+            m = _PATTERN_BACKUP_FAILED.search(event)
+            task_name = m.group(1)
+            outcome = "failed"
 
-        if task_name not in remaining:
+        if task_name is None or task_name not in remaining:
             continue
 
         time_str = entry.get("time", "")
@@ -171,7 +180,7 @@ def parse_last_backups(log_entries: list, task_names: set) -> dict:
 
         results[task_name] = {
             "last_backup_time": timestamp,
-            "last_backup_result": "success" if "finished" in outcome else "failed",
+            "last_backup_result": outcome,
         }
         remaining.discard(task_name)
 

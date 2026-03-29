@@ -148,18 +148,23 @@ def check_synology_hyperbackup(
     if last_backup_time is not None:
         age = now - float(last_backup_time)
 
-        yield from check_levels(
-            value=age,
-            metric_name="backup_age",
-            levels_upper=("fixed", (warn_age, crit_age)),
-            render_func=render.timespan,
-            label="Last backup",
-        )
-
         if last_backup_result == "failed":
-            yield Result(state=State.CRIT, notice="Last backup ended with failure")
-        elif last_backup_result == "success":
-            yield Result(state=State.OK, notice="Last backup completed successfully")
+            # A failed backup is always CRIT – age thresholds do not apply
+            yield Result(
+                state=State.CRIT,
+                summary=f"Last backup failed ({render.timespan(age)} ago)",
+            )
+            yield Metric("backup_age", age)
+        else:
+            yield from check_levels(
+                value=age,
+                metric_name="backup_age",
+                levels_upper=("fixed", (warn_age, crit_age)),
+                render_func=render.timespan,
+                label="Last backup",
+            )
+            if last_backup_result == "success":
+                yield Result(state=State.OK, notice="Last backup completed successfully")
     else:
         yield Result(
             state=State.UNKNOWN,
